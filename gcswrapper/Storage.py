@@ -1,11 +1,8 @@
-#!/opt/conda/bin/python
-# coding: utf-8
-
-from multiprocessing import cpu_count, Pool
+from multiprocessing import cpu_count
+from multiprocessing.pool import ThreadPool as Pool
 from google.cloud import storage
 from google.cloud.exceptions import NotFound
-from os import walk, path, makedirs, environ
-from pathlib import Path
+from os import walk, path, makedirs
 import random
 import time
 import requests
@@ -13,7 +10,7 @@ import urllib3
 from ratelimiter import RateLimiter
 
 
-class Storage:
+class GcloudStorage:
     """
     Perform action using Cloud Client Storage Library for python
 
@@ -23,69 +20,43 @@ class Storage:
 
     Parameters
     ----------
-    action : str, "cp", "rm", "mv" or "ls"
-        only "ls" has return value, list of files
-    recursive: bool, True or False
-    inputLocation: str
-        Can be a file or folder
-    outputLocation: str, (default=None)
-        Can be a file or folder
-        If action is "rm", this parameter is not used
-    multicore: bool, True or False, (default=True)
-        Set true to use multicore to speed up when manipulating multiple files
-        This by default use all cores and is adjusted using coreOffset
-    verbose: bool, True or False, (default=True)
-        Print action message
-        e.g. uploading from bla to bla
     project: str, (default='wx-bq-poc')
         Set Gcloud project
     coreOffset: int, (default=-1)
         Set coreOffset for multiprocess,
-        by default we use 1 less core to the all available core due kubenete
-    retry: int, (default=3)
+        by default we use 1 less core*10 threads to the all available core due kubenete
+    retry: int, (default=23)
         Set number of retry for fail api request,
         exponentail retry + random jitter
+        by default, will retry 23 times over 1+2+4+8+16+32+60... seconds
+        for about 10 minutes
     """
 
     def __init__(
-        self,
-        action,
-        recursive,
-        inputLocation,
-        outputLocation=None,
-        multicore=True,
-        verbose=True,
-        project="",
-        coreOffset=-1,
-        retry=5,
+        self, project, multicore=True, coreOffset=-1, retry=23,
     ):
-        self.action = action
-        self.recursive = recursive
-        (
-            self.inputLocation,
-            self.inputGSExist,
-            self.inputBucket,
-        ) = self.breakPath(inputLocation)
-        if action not in ["rm", "ls"]:
-            (
-                self.outputLocation,
-                self.outputGSExist,
-                self.outputBucket,
-            ) = self.breakPath(outputLocation)
-        else:
-            self.outputLocation, self.outputGSExist, self.outputBucket = (
-                None,
-                None,
-                None,
-            )
+        self.project = project
+        self.client = storage.Client(project=self.project)
+        self.inputBucketObject = None
+        self.outputBucketObject = None
+
+        self.action = None
+        self.recursive = None
+
+        self.inputLocation = None
+        self.inputGSExist = None
+
+        self.outputLocation = None
+        self.outputGSExist = None
+
         self.multicore = multicore
         if multicore:
             self.nCore = cpu_count()
-        self.project = environ.get("PROJECT", project)
-        self.verbose = verbose
         self.coreOffset = coreOffset
         self.delay = [
-            (2 ** i) + (random.randint(0, 1000) / 1000) for i in range(retry)
+            min(random.randint(0, 2 ** i), 60)
+            + (random.randint(0, 1000) / 1000)
+            for i in range(retry)
         ]
 
     def retry(
@@ -120,59 +91,11 @@ class Storage:
 
         return wrapper
 
-    def printAction(fn):
-        def _decorator(self, inputLocation, outputLocation):
-            if self.verbose:
-                if self.action == "rm":
-                    print(f"Removing gs://{self.inputBucket}/{inputLocation}")
-                elif self.action == "mv":
-                    print(
-                        f"Moving gs://{self.inputBucket}/{inputLocation} To gs://{self.outputBucket}/{outputLocation}"
-                    )
-                elif self.action == "cp":
-                    print(
-                        f"Copying {'gs://' if self.inputGSExist else ''}{self.inputBucket+'/' if self.inputBucket else ''}{inputLocation} To {'gs://' if self.outputGSExist else ''}{self.outputBucket+'/' if self.outputBucket else ''}{outputLocation}"
-                    )
-                else:
-                    raise ValueError("No matching option")
-            return fn(self, inputLocation, outputLocation)
-
-        return _decorator
-
-    def _decorator(self, inputLocation, outputLocation):
-        if self.verbose:
-            if self.action == "rm":
-                print(f"Removing gs://{self.inputBucket}/{inputLocation}")
-            elif self.action == "mv":
-                print(
-                    f"Moving gs://{self.inputBucket}/{inputLocation} To gs://{self.outputBucket}/{outputLocation}"
-                )
-            elif self.action == "cp":
-                print(
-                    f"Copying {'gs://' if self.inputGSExist else ''}{self.inputBucket+'/' if self.inputBucket else ''}{inputLocation} To {'gs://' if self.outputGSExist else ''}{self.outputBucket+'/' if self.outputBucket else ''}{outputLocation}"
-                )
-            else:
-                raise ValueError("No matching option")
-
     def getCore(self):
         nCore = cpu_count() + self.coreOffset
         if nCore == 0:
             nCore = 1
-        return nCore
-
-    def print(self):
-        print(f"multicore:      {self.multicore}")
-        print(f"project:        {self.project}")
-        print(f"action:         {self.action}")
-        print(f"recursive:      {self.recursive}")
-        print("INPUT--------------------------------")
-        print(f"inputGS:        {self.inputGSExist}")
-        print(f"inputBucket:    {self.inputBucket}")
-        print(f"inputLocation:  {self.inputLocation}")
-        print("OUTPUT--------------------------------")
-        print(f"outputGS:       {self.outputGSExist}")
-        print(f"outputBucket:   {self.outputBucket}")
-        print(f"outputLocation: {self.outputLocation}")
+        return nCore * 10
 
     def breakPath(self, path):
         pathNoGs, gsExist = self.gsExist(path)
@@ -198,42 +121,51 @@ class Storage:
         output = "/".join(path.split("/")[1:])
         return output, bucket
 
+    def setBucketObject(self, inputBucket, outputBucket):
+        if inputBucket:
+            if self.inputBucketObject:
+                if self.inputBucketObject.name != inputBucket:
+                    self.inputBucketObject = self.client.get_bucket(
+                        inputBucket
+                    )
+            else:
+                self.inputBucketObject = self.client.get_bucket(inputBucket)
+        if outputBucket:
+            if self.outputBucketObject:
+                if self.outputBucketObject.name != outputBucket:
+                    self.outputBucketObject = self.client.get_bucket(
+                        outputBucket
+                    )
+            else:
+                self.outputBucketObject = self.client.get_bucket(outputBucket)
+
     @retry(report=print)
     def cpLocalToGs(self, inputLocation, outputLocation):
-        client = storage.Client(self.project)
-        bucket = client.get_bucket(self.outputBucket)
-        blob = bucket.blob(outputLocation)
+        blob = self.outputBucketObject.blob(outputLocation)
         blob.upload_from_filename(inputLocation)
 
     @retry(report=print)
     def cpGsToLocal(self, inputLocation, outputLocation):
-        client = storage.Client(project=self.project)
-        bucket = client.get_bucket(self.inputBucket)
-        blob = bucket.get_blob(inputLocation)
+        blob = self.inputBucketObject.get_blob(inputLocation)
         blob.download_to_filename(outputLocation)
 
     @retry(report=print)
     def cpGsToGs(self, inputLocation, outputLocation):
-        client = storage.Client(project=self.project)
-        inputBucket = client.get_bucket(self.inputBucket)
-        outputBucket = client.get_bucket(self.outputBucket)
-        inputBlob = inputBucket.blob(inputLocation)
-        inputBucket.copy_blob(inputBlob, outputBucket, outputLocation)
+        inputBlob = self.inputBucketObject.blob(inputLocation)
+        self.inputBucketObject.copy_blob(
+            inputBlob, self.outputBucketObject, outputLocation
+        )
 
     @retry(report=print)
     def rmGs(self, inputLocation):
-        client = storage.Client(project=self.project)
-        bucket = client.get_bucket(self.inputBucket)
         try:
-            bucket.delete_blob(inputLocation)
+            self.inputBucketObject.delete_blob(inputLocation)
         except NotFound:
             pass
 
     @retry(report=print)
     def lsGs(self, inputLocation):
-        client = storage.Client(project=self.project)
-        bucket = client.get_bucket(self.inputBucket)
-        blobs = bucket.list_blobs(prefix=inputLocation)
+        blobs = self.inputBucketObject.list_blobs(prefix=inputLocation)
         blob_list = [
             blob.name for blob in blobs if not blob.name.endswith("/")
         ]
@@ -242,22 +174,19 @@ class Storage:
     @retry(report=print)
     def mvGsToGsSameBucket(self, inputLocation, outputLocation):
         # only wihtin the same bucket
-        client = storage.Client(project=self.project)
-        bucket = client.get_bucket(self.inputBucket)
-        blob = bucket.blob(inputLocation)
-        bucket.rename_blob(blob, outputLocation)
+        blob = self.inputBucketObject.blob(inputLocation)
+        self.inputBucketObject.rename_blob(blob, outputLocation)
 
+    @retry(report=print)
     def mvGsToGs(self, inputLocation, outputLocation):
-        if self.inputBucket == self.outputBucket:
+        if self.inputBucketObject.name == self.outputBucketObject.name:
             self.mvGsToGsSameBucket(inputLocation, outputLocation)
         else:
             self.cpGsToGs(inputLocation, outputLocation)
             self.rmGs(inputLocation)
 
-    # @printAction
     @RateLimiter(max_calls=1, period=1)
     def getAction(self, inputLocation, outputLocation):
-        self._decorator(inputLocation, outputLocation)
         if self.action == "mv":
             return self.mvGsToGs(inputLocation, outputLocation)
         elif self.action == "rm":
@@ -317,9 +246,9 @@ class Storage:
                 x.replace(inputLocation, outputLocation, 1) for x in inputList
             ]
         else:
-            client = storage.Client(project=self.project)
-            bucket = client.get_bucket(self.inputBucket)
-            blobs = bucket.list_blobs(prefix=inputLocation + "/")
+            blobs = self.inputBucketObject.list_blobs(
+                prefix=inputLocation + "/"
+            )
             inputList = [
                 blob.name for blob in blobs if not blob.name.endswith("/")
             ]
@@ -345,11 +274,7 @@ class Storage:
                     makedirs(directory)
         return inputList, outputList
 
-    def run(self, logger=None):
-        if logger is not None:
-            logger.info(
-                f"{self.action}..ing.. {self.inputLocation} -> {self.outputLocation}"
-            )
+    def run(self):
         inputLocation = self.inputLocation
         outputLocation = self.outputLocation
         if self.action == "ls":
@@ -359,24 +284,131 @@ class Storage:
                 inputLocation, outputLocation
             )
             self.getAction(inputLocation, outputLocation)
+            return 0
         elif self.recursive and self.multicore is False:
             inputList, outputList = self.processLocationRecursive(
                 inputLocation, outputLocation
             )
             for _input, _output in zip(inputList, outputList):
                 self.getAction(_input, _output)
+            return 0
         elif self.recursive and self.multicore:
             inputList, outputList = self.processLocationRecursive(
                 inputLocation, outputLocation
             )
             with Pool(processes=self.getCore()) as pool:
                 pool.starmap(self.getAction, zip(inputList, outputList))
+            return 0
 
-    @staticmethod
-    def exist(file_path) -> bool:
-        p = Storage("ls", False, file_path).run()
-        return len(p) > 0
+    def copy(self, src_path: str, dest_path: str, recursive: bool = False):
+        self.action = "cp"
+        self.recursive = recursive
 
-    @staticmethod
-    def to_gcs_path(p, *args):
-        return f"gs://{Path(p).joinpath(*args).as_posix()}"
+        (self.inputLocation, self.inputGSExist, inputBucket,) = self.breakPath(
+            src_path
+        )
+        (
+            self.outputLocation,
+            self.outputGSExist,
+            outputBucket,
+        ) = self.breakPath(dest_path)
+        self.setBucketObject(inputBucket, outputBucket)
+        return self.run()
+
+    def list(self, path: str, recursive: bool = False):
+        self.action = "ls"
+        self.recursive = recursive
+        (self.inputLocation, self.inputGSExist, inputBucket,) = self.breakPath(
+            path
+        )
+        self.outputLocation, self.outputGSExist, outputBucket = (
+            None,
+            None,
+            None,
+        )
+        self.setBucketObject(inputBucket, outputBucket)
+        return self.run()
+
+    def remove(self, path: str, recursive: bool = False):
+        self.action = "rm"
+        self.recursive = recursive
+        (self.inputLocation, self.inputGSExist, inputBucket,) = self.breakPath(
+            path
+        )
+        self.outputLocation, self.outputGSExist, outputBucket = (
+            None,
+            None,
+            None,
+        )
+        self.setBucketObject(inputBucket, outputBucket)
+        return self.run()
+
+
+if __name__ == "__main__":
+    # from helper import GcloudStorage
+    import shutil
+    import os
+
+    # integration test
+    PROJECT = "gcp-wow-rwds-ai-mmm-super-dev"
+    BUCKET = "wx-lty-mmm-super-dev"
+    store = GcloudStorage(PROJECT)
+
+    # no recursive
+    filename = content = "test1.txtt"
+    directory = subdirectory = "test"
+
+    with open(f"{filename}", "w") as f:
+        f.write(f"{content}")
+
+    res = store.copy(f"{filename}", f"gs://{BUCKET}/{directory}/")
+    assert res == 0
+    res = store.list(f"gs://{BUCKET}/{directory}/")
+    assert res == [f"{directory}/{filename}"]
+    res = store.copy(
+        f"gs://{BUCKET}/{directory}/{filename}",
+        f"gs://{BUCKET}/{directory}/{filename}2",
+    )
+    assert res == [f"{directory}/{filename}", f"{directory}/{filename}2"]
+    res = store.remove(f"gs://{BUCKET}/{directory}/{filename}2")
+    assert res == 0
+    res = store.list(f"gs://{BUCKET}/{directory}/")
+    assert res == [f"{directory}/{filename}"]
+    res = store.copy(f"{filename}", f"gs://{BUCKET}/{directory}/{filename}2")
+    assert res == 0
+    res = store.list(f"gs://{BUCKET}/{directory}/")
+    assert res == [f"{directory}/{filename}", f"{directory}/{filename}2"]
+
+    # recursive
+    res = store.remove(f"gs://{BUCKET}/{directory}/", recursive=True)
+    assert res == 0
+    res = store.list(f"gs://{BUCKET}/{directory}/")
+    assert res == []
+
+    os.makedirs(f"{directory}/{subdirectory}")
+    with open(f"{directory}/{filename}", "w") as f:
+        f.write(f"{content}")
+    with open(f"{directory}/{subdirectory}/{filename}", "w") as f:
+        f.write(f"{content}")
+    try:
+        store.copy(f"{directory}/", f"gs://{BUCKET}/{directory}")
+    except Exception as e:
+        assert str(type(e)) == "<class 'IsADirectoryError'>"
+
+    res = store.copy(
+        f"{directory}/", f"gs://{BUCKET}/{directory}", recursive=True
+    )
+    assert res == 0
+    res = store.list(f"gs://{BUCKET}/{directory}/")
+    assert res == [
+        f"{directory}/{subdirectory}/{filename}",
+        f"{directory}/{filename}",
+    ]
+    res = store.remove(f"gs://{BUCKET}/{directory}", recursive=True)
+    assert res == 0
+    res = store.list(f"gs://{BUCKET}/{directory}/")
+    assert res == []
+
+    # clean up
+    os.remove(f"{filename}")
+    shutil.rmtree(f"{directory}")
